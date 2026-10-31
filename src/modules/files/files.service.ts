@@ -1,6 +1,7 @@
 import { HttpStatus, Injectable, Logger } from '@nestjs/common';
 import { $Enums, type FileUpload, type Prisma } from '@prisma/client';
 import { createHash, randomUUID } from 'crypto';
+import { ConfigService } from '@nestjs/config';
 import type { AuthUser } from '../../common/interfaces/auth-user.interface.js';
 import { AppError } from '../../common/errors/app-error.js';
 import { FilesRepository } from './files.repository.js';
@@ -10,6 +11,7 @@ import {
   MAX_LIST_LIMIT,
   MIME_WHITELIST,
   PRESIGN_EXPIRY_SECONDS,
+  DEFAULT_PENDING_FILE_TTL_HOURS,
 } from './files.constants.js';
 import { sanitizeFilename } from './utils/sanitize-filename.js';
 import {
@@ -18,6 +20,14 @@ import {
   type FileUploadListDto,
 } from './utils/file-upload.mapper.js';
 import type { ListFilesQueryDto } from './dto/list-files-query.dto.js';
+import type { UploadFileDto } from './dto/upload-file.dto.js';
+import type { ConfirmFilesDto } from './dto/confirm-files.dto.js';
+import type { ReconcileFilesDto } from './dto/reconcile-files.dto.js';
+
+export interface FileReconcileResultDto {
+  confirmed: FileUploadDto[];
+  softDeleted: number;
+}
 
 export interface UploadedFile {
   originalname: string;
@@ -33,6 +43,7 @@ export class FilesService {
   constructor(
     private readonly filesRepository: FilesRepository,
     private readonly minioService: MinioService,
+    private readonly configService: ConfigService,
   ) {}
 
   ensureOwnershipOrAdmin(file: FileUpload, user: AuthUser): void {
@@ -48,6 +59,7 @@ export class FilesService {
   async upload(
     file: UploadedFile | undefined,
     user: AuthUser,
+    metadata: UploadFileDto = {},
   ): Promise<FileUploadDto> {
     if (!file) {
       throw new AppError(
@@ -93,6 +105,8 @@ export class FilesService {
     }
 
     try {
+      const now = Date.now();
+      const pendingTtlMs = this.getPendingFileTtlMs();
       const created = await this.filesRepository.create({
         bucket: this.minioService.bucketName,
         objectKey,
@@ -100,6 +114,10 @@ export class FilesService {
         mimeType: file.mimetype,
         sizeBytes: file.size,
         checksum,
+        status: 'PENDING',
+        expiresAt: new Date(now + pendingTtlMs),
+        entityType: metadata.entityType ?? null,
+        entityId: metadata.entityId ?? null,
         uploadedBy: user.id,
       });
       return toFileUploadDto(created);
@@ -198,6 +216,67 @@ export class FilesService {
     return toFileUploadDto(updated);
   }
 
+  async confirm(
+    dto: ConfirmFilesDto,
+    user: AuthUser,
+  ): Promise<FileUploadDto[]> {
+    const ids = [...new Set(dto.fileIds)];
+    const files = await this.filesRepository.findManyByIds(ids);
+    if (files.length !== ids.length) {
+      throw new AppError(
+        HttpStatus.NOT_FOUND,
+        'FILE_NOT_FOUND',
+        'File not found',
+      );
+    }
+    for (const file of files) {
+      this.ensureOwnershipOrAdmin(file, user);
+    }
+    const confirmedAt = new Date();
+    const confirmed = await this.filesRepository.confirmMany({
+      ids,
+      confirmedAt,
+      entityType: dto.entityType,
+      entityId: dto.entityId,
+    });
+    return confirmed.map(toFileUploadDto);
+  }
+
+  async reconcile(
+    dto: ReconcileFilesDto,
+    user: AuthUser,
+  ): Promise<FileReconcileResultDto> {
+    const ids = [...new Set(dto.activeFileIds)];
+    const files = await this.filesRepository.findManyByIds(ids);
+    if (files.length !== ids.length) {
+      throw new AppError(
+        HttpStatus.NOT_FOUND,
+        'FILE_NOT_FOUND',
+        'File not found',
+      );
+    }
+    for (const file of files) {
+      this.ensureOwnershipOrAdmin(file, user);
+    }
+    const confirmed = await this.filesRepository.confirmMany({
+      ids,
+      confirmedAt: new Date(),
+      entityType: dto.entityType,
+      entityId: dto.entityId,
+    });
+    const softDeleted = await this.filesRepository.softDeleteByEntityExcept({
+      entityType: dto.entityType,
+      entityId: dto.entityId,
+      exceptIds: ids,
+      deletedBy: user.id,
+      uploadedBy: user.role === $Enums.RoleName.ADMIN ? undefined : user.id,
+    });
+    return {
+      confirmed: confirmed.map(toFileUploadDto),
+      softDeleted,
+    };
+  }
+
   private async getAccessibleActiveFile(
     id: string,
     user: AuthUser,
@@ -266,5 +345,13 @@ export class FilesService {
     }
     const extension = originalName.slice(dotIndex + 1).toLowerCase();
     return MIME_WHITELIST[extension];
+  }
+
+  private getPendingFileTtlMs(): number {
+    const hours = this.configService.get<number>(
+      'PENDING_FILE_TTL_HOURS',
+      DEFAULT_PENDING_FILE_TTL_HOURS,
+    );
+    return hours * 60 * 60 * 1000;
   }
 }
