@@ -53,7 +53,11 @@ model FileUpload {
   mimeType     String    @map("mime_type")
   sizeBytes    Int       @map("size_bytes")
   checksum     String
-  status       String    @default("ACTIVE")
+  status       String    @default("PENDING")
+  expiresAt    DateTime? @map("expires_at") @db.Timestamptz(6)
+  confirmedAt  DateTime? @map("confirmed_at") @db.Timestamptz(6)
+  entityType   String?   @map("entity_type")
+  entityId     String?   @map("entity_id")
   isDeleted    Boolean   @default(false) @map("is_deleted")
   deletedAt    DateTime? @map("deleted_at") @db.Timestamptz(6)
   deletedBy    String?   @map("deleted_by")
@@ -69,5 +73,6 @@ model FileUpload {
   @@index([createdAt(sort: Desc)])
   @@index([checksum])
   @@index([isDeleted, deletedAt])
+  @@index([status, expiresAt])
   @@map("file_uploads")
 }

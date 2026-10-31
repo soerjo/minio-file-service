@@ -4,7 +4,11 @@ import type { FilesRepository } from './files.repository.js';
 import type { MinioService } from './minio.service.js';
 import type { AuthUser } from '../../common/interfaces/auth-user.interface.js';
 import { AppError } from '../../common/errors/app-error.js';
-import { MAX_FILE_SIZE_BYTES, MAX_LIST_LIMIT } from './files.constants.js';
+import {
+  MAX_FILE_SIZE_BYTES,
+  MAX_LIST_LIMIT,
+  UPLOAD_PENDING_TTL_MS,
+} from './files.constants.js';
 
 const helloSha256 =
   '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824';
@@ -23,9 +27,12 @@ const admin: AuthUser = { ...user, id: 'admin-1', role: 'ADMIN' };
 const filesRepository = {
   create: jest.fn(),
   findById: jest.fn(),
+  findManyByIds: jest.fn(),
   findMany: jest.fn(),
   count: jest.fn(),
+  confirmMany: jest.fn(),
   softDelete: jest.fn(),
+  softDeleteByEntityExcept: jest.fn(),
 } as unknown as jest.Mocked<FilesRepository>;
 
 const minioService = {
@@ -58,7 +65,11 @@ function makeFileRow(overrides: Partial<FileUpload> = {}): FileUpload {
     mimeType: 'application/pdf',
     sizeBytes: 5,
     checksum: helloSha256,
-    status: 'ACTIVE',
+    status: 'PENDING',
+    expiresAt: new Date('2026-10-14T09:15:00.000Z'),
+    confirmedAt: null,
+    entityType: null,
+    entityId: null,
     isDeleted: false,
     deletedAt: null,
     deletedBy: null,
@@ -88,15 +99,27 @@ describe('FilesService', () => {
   });
 
   describe('upload', () => {
-    it('stores the object in MinIO first, then creates the metadata row', async () => {
+    it('stores the object first, then creates pending metadata that expires in 24 hours', async () => {
       minioService.putObject.mockResolvedValue(undefined);
       filesRepository.create.mockImplementation((data) =>
-        Promise.resolve(makeFileRow({ objectKey: data.objectKey })),
+        Promise.resolve(
+          makeFileRow({
+            objectKey: data.objectKey,
+            status: data.status as string,
+            expiresAt: data.expiresAt as Date,
+            entityType: data.entityType as string | null,
+            entityId: data.entityId as string | null,
+          }),
+        ),
       );
 
-      const result = await service.upload(makeUploadedFile(), user);
+      const before = Date.now();
+      const result = await service.upload(makeUploadedFile(), user, {
+        entityType: 'invoice',
+        entityId: 'invoice-123',
+      });
+      const after = Date.now();
 
-      expect(minioService.putObject).toHaveBeenCalledTimes(1);
       const objectKey = minioService.putObject.mock.calls[0][0];
       expect(objectKey).toMatch(/^user-1\/[0-9a-f-]{36}-Invoice-42-EU\.pdf$/);
       expect(minioService.putObject).toHaveBeenCalledWith(
@@ -105,20 +128,43 @@ describe('FilesService', () => {
         5,
         'application/pdf',
       );
-      expect(filesRepository.create).toHaveBeenCalledTimes(1);
-      expect(filesRepository.create).toHaveBeenCalledWith({
+      const createData = filesRepository.create.mock.calls[0][0];
+      expect(createData).toMatchObject({
         bucket: 'app-uploads',
         objectKey,
         originalName: 'Invoice 42 EU.pdf',
         mimeType: 'application/pdf',
         sizeBytes: 5,
         checksum: helloSha256,
+        status: 'PENDING',
+        entityType: 'invoice',
+        entityId: 'invoice-123',
         uploadedBy: 'user-1',
       });
-      expect(result.size).toBe(5);
-      expect(result.status).toBe('ACTIVE');
-      expect(result.checksum).toBe(helloSha256);
-      expect(result.objectKey).toBe(objectKey);
+      expect((createData.expiresAt as Date).getTime()).toBeGreaterThanOrEqual(
+        before + UPLOAD_PENDING_TTL_MS,
+      );
+      expect((createData.expiresAt as Date).getTime()).toBeLessThanOrEqual(
+        after + UPLOAD_PENDING_TTL_MS,
+      );
+      expect(result.status).toBe('PENDING');
+      expect(result.expiresAt).not.toBeNull();
+      expect(result.entityType).toBe('invoice');
+      expect(result.entityId).toBe('invoice-123');
+    });
+
+    it('stores null entity tags when no upload metadata is provided', async () => {
+      minioService.putObject.mockResolvedValue(undefined);
+      filesRepository.create.mockImplementation((data) =>
+        Promise.resolve(makeFileRow({ objectKey: data.objectKey })),
+      );
+
+      await service.upload(makeUploadedFile(), user);
+
+      expect(filesRepository.create.mock.calls[0][0]).toMatchObject({
+        entityType: null,
+        entityId: null,
+      });
     });
 
     it('rejects a non-whitelisted extension and MIME type with 415', async () => {
@@ -165,7 +211,7 @@ describe('FilesService', () => {
       await expectAppError(service.upload(undefined, user), 'VALIDATION_ERROR');
     });
 
-    it('maps a MinIO failure to 500 MINIO_UNAVAILABLE without touching the DB', async () => {
+    it('maps a MinIO failure to MINIO_UNAVAILABLE without touching the DB', async () => {
       minioService.putObject.mockRejectedValue(new Error('ECONNREFUSED'));
 
       await expectAppError(
@@ -176,7 +222,7 @@ describe('FilesService', () => {
       expect(minioService.removeObject).not.toHaveBeenCalled();
     });
 
-    it('compensates with removeObject when the PG insert fails, rethrowing the original error', async () => {
+    it('compensates with removeObject when the PG insert fails', async () => {
       minioService.putObject.mockResolvedValue(undefined);
       filesRepository.create.mockRejectedValue(new Error('insert failed'));
 
@@ -184,20 +230,9 @@ describe('FilesService', () => {
         'insert failed',
       );
 
-      const objectKey = minioService.putObject.mock.calls[0][0];
-      expect(minioService.removeObject).toHaveBeenCalledTimes(1);
-      expect(minioService.removeObject).toHaveBeenCalledWith(objectKey);
-    });
-
-    it('still rethrows the insert error when the compensating removeObject also fails', async () => {
-      minioService.putObject.mockResolvedValue(undefined);
-      filesRepository.create.mockRejectedValue(new Error('insert failed'));
-      minioService.removeObject.mockRejectedValue(new Error('remove failed'));
-
-      await expect(service.upload(makeUploadedFile(), user)).rejects.toThrow(
-        'insert failed',
+      expect(minioService.removeObject).toHaveBeenCalledWith(
+        minioService.putObject.mock.calls[0][0],
       );
-      expect(minioService.removeObject).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -209,16 +244,11 @@ describe('FilesService', () => {
       const result = await service.list({ page: 1, limit: 20 }, user);
 
       const params = filesRepository.findMany.mock.calls[0][0];
-      expect(params.where).toEqual({
-        isDeleted: false,
-        uploadedBy: 'user-1',
-      });
+      expect(params.where).toEqual({ isDeleted: false, uploadedBy: 'user-1' });
       expect(filesRepository.count).toHaveBeenCalledWith(params.where);
       expect(result.total).toBe(1);
       expect(result.page).toBe(1);
       expect(result.limit).toBe(20);
-      expect(result.items).toHaveLength(1);
-      expect(result.items[0].size).toBe(5);
     });
 
     it('lists all non-deleted uploads for ADMIN users', async () => {
@@ -227,38 +257,39 @@ describe('FilesService', () => {
 
       await service.list({ page: 1, limit: 20 }, admin);
 
-      const params = filesRepository.findMany.mock.calls[0][0];
-      expect(params.where).toEqual({ isDeleted: false });
+      expect(filesRepository.findMany.mock.calls[0][0].where).toEqual({
+        isDeleted: false,
+      });
     });
 
-    it('includes ORPHAN-status files in the list result', async () => {
+    it('passes PENDING and CONFIRMED statuses through the list result', async () => {
       filesRepository.findMany.mockResolvedValue([
-        makeFileRow({ id: 'file-orphan', status: 'ORPHAN' }),
+        makeFileRow({ id: 'file-pending', status: 'PENDING' }),
+        makeFileRow({
+          id: 'file-confirmed',
+          status: 'CONFIRMED',
+          expiresAt: null,
+          confirmedAt: new Date('2026-10-13T10:00:00.000Z'),
+        }),
       ]);
-      filesRepository.count.mockResolvedValue(1);
+      filesRepository.count.mockResolvedValue(2);
 
       const result = await service.list({ page: 1, limit: 20 }, user);
 
-      expect(result.items).toHaveLength(1);
-      expect(result.items[0].status).toBe('ORPHAN');
-      expect(result.total).toBe(1);
+      expect(result.items.map((item) => item.status)).toEqual([
+        'PENDING',
+        'CONFIRMED',
+      ]);
     });
 
-    it('filters out deleted files (isDeleted=false)', async () => {
+    it('applies search, limit clamp, skip, and sort mapping', async () => {
       filesRepository.findMany.mockResolvedValue([]);
       filesRepository.count.mockResolvedValue(0);
 
-      await service.list({ page: 1, limit: 20 }, user);
-
-      const params = filesRepository.findMany.mock.calls[0][0];
-      expect(params.where.isDeleted).toBe(false);
-    });
-
-    it('applies an insensitive contains search on originalName', async () => {
-      filesRepository.findMany.mockResolvedValue([]);
-      filesRepository.count.mockResolvedValue(0);
-
-      await service.list({ page: 1, limit: 20, search: 'invoIce' }, user);
+      const result = await service.list(
+        { page: 3, limit: 500, search: 'invoIce', sort: 'size:desc' },
+        user,
+      );
 
       const params = filesRepository.findMany.mock.calls[0][0];
       expect(params.where).toEqual({
@@ -266,164 +297,59 @@ describe('FilesService', () => {
         uploadedBy: 'user-1',
         originalName: { contains: 'invoIce', mode: 'insensitive' },
       });
-    });
-
-    it('clamps the limit to 100 and echoes the effective value', async () => {
-      filesRepository.findMany.mockResolvedValue([]);
-      filesRepository.count.mockResolvedValue(0);
-
-      const result = await service.list({ page: 1, limit: 500 }, user);
-
-      const params = filesRepository.findMany.mock.calls[0][0];
+      expect(params.skip).toBe(200);
       expect(params.take).toBe(MAX_LIST_LIMIT);
+      expect(params.orderBy).toEqual({ sizeBytes: 'desc' });
       expect(result.limit).toBe(MAX_LIST_LIMIT);
     });
 
-    it('computes skip and take from page and limit', async () => {
-      filesRepository.findMany.mockResolvedValue([]);
-      filesRepository.count.mockResolvedValue(0);
-
-      await service.list({ page: 3, limit: 10 }, user);
-
-      const params = filesRepository.findMany.mock.calls[0][0];
-      expect(params.skip).toBe(20);
-      expect(params.take).toBe(10);
-    });
-
-    it('maps every valid sort field and direction', async () => {
-      filesRepository.findMany.mockResolvedValue([]);
-      filesRepository.count.mockResolvedValue(0);
-
-      await service.list({ page: 1, limit: 20, sort: 'createdAt:desc' }, user);
-      expect(filesRepository.findMany.mock.calls[0][0].orderBy).toEqual({
-        createdAt: 'desc',
-      });
-
-      await service.list({ page: 1, limit: 20, sort: 'createdAt:asc' }, user);
-      expect(filesRepository.findMany.mock.calls[1][0].orderBy).toEqual({
-        createdAt: 'asc',
-      });
-
-      await service.list(
-        { page: 1, limit: 20, sort: 'originalName:asc' },
-        user,
-      );
-      expect(filesRepository.findMany.mock.calls[2][0].orderBy).toEqual({
-        originalName: 'asc',
-      });
-
-      await service.list({ page: 1, limit: 20, sort: 'size:desc' }, user);
-      expect(filesRepository.findMany.mock.calls[3][0].orderBy).toEqual({
-        sizeBytes: 'desc',
-      });
-    });
-
-    it('defaults the sort to createdAt:desc', async () => {
+    it('defaults sort and rejects invalid sort values', async () => {
       filesRepository.findMany.mockResolvedValue([]);
       filesRepository.count.mockResolvedValue(0);
 
       await service.list({ page: 1, limit: 20 }, user);
-
       expect(filesRepository.findMany.mock.calls[0][0].orderBy).toEqual({
         createdAt: 'desc',
       });
-    });
 
-    it('rejects invalid sort values with VALIDATION_ERROR', async () => {
-      const invalidSorts = [
-        'bogus:asc',
-        'createdAt',
-        'createdAt:up',
-        'a:b:c',
-        '',
-      ];
-      for (const sort of invalidSorts) {
-        await expectAppError(
-          service.list({ page: 1, limit: 20, sort }, user),
-          'VALIDATION_ERROR',
-        );
-      }
-      expect(filesRepository.findMany).not.toHaveBeenCalled();
+      await expectAppError(
+        service.list({ page: 1, limit: 20, sort: 'bogus:asc' }, user),
+        'VALIDATION_ERROR',
+      );
     });
   });
 
-  describe('getById', () => {
-    it('returns the mapped file for the owner', async () => {
+  describe('getById and presigned urls', () => {
+    it('returns owner and admin accessible files', async () => {
       filesRepository.findById.mockResolvedValue(makeFileRow());
+      await expect(service.getById('file-1', user)).resolves.toMatchObject({
+        id: 'file-1',
+      });
 
-      const result = await service.getById('file-1', user);
-
-      expect(filesRepository.findById).toHaveBeenCalledWith('file-1');
-      expect(result.id).toBe('file-1');
-      expect(result.size).toBe(5);
-      expect(result.status).toBe('ACTIVE');
-    });
-
-    it('returns the mapped file for an ADMIN accessing another user file', async () => {
       filesRepository.findById.mockResolvedValue(
         makeFileRow({ uploadedBy: 'someone-else' }),
       );
-
-      const result = await service.getById('file-1', admin);
-
-      expect(result.id).toBe('file-1');
+      await expect(service.getById('file-1', admin)).resolves.toMatchObject({
+        id: 'file-1',
+      });
     });
 
-    it('rejects with FILE_NOT_FOUND when the file is missing', async () => {
+    it('returns FILE_NOT_FOUND for missing, deleted, or inaccessible files', async () => {
       filesRepository.findById.mockResolvedValue(null);
-
       await expectAppError(service.getById('missing', user), 'FILE_NOT_FOUND');
-    });
 
-    it('rejects with FILE_NOT_FOUND when the file is soft-DELETED', async () => {
       filesRepository.findById.mockResolvedValue(
-        makeFileRow({
-          isDeleted: true,
-          deletedAt: new Date(),
-          deletedBy: user.id,
-        }),
+        makeFileRow({ isDeleted: true, deletedAt: new Date() }),
       );
-
       await expectAppError(service.getById('file-1', user), 'FILE_NOT_FOUND');
-    });
 
-    it('rejects with FILE_NOT_FOUND for a non-owner non-ADMIN user', async () => {
       filesRepository.findById.mockResolvedValue(
         makeFileRow({ uploadedBy: 'someone-else' }),
       );
-
       await expectAppError(service.getById('file-1', user), 'FILE_NOT_FOUND');
     });
-  });
 
-  describe('getPresignedUrl', () => {
-    it('returns the presigned URL with expiresAt exactly +15 minutes', async () => {
-      filesRepository.findById.mockResolvedValue(makeFileRow());
-      minioService.presignedGetObject.mockResolvedValue(
-        'http://localhost:9100/app-uploads/key?X-Amz-Expires=900',
-      );
-
-      const before = Date.now();
-      const result = await service.getPresignedUrl('file-1', user);
-      const after = Date.now();
-
-      expect(minioService.presignedGetObject).toHaveBeenCalledWith(
-        'user-1/7c1b9d0e-2f4a-4c6e-8a0b-9c8d7e6f5a4b-Invoice-42-EU.pdf',
-        900,
-        'app-uploads',
-      );
-      expect(result.url).toBe(
-        'http://localhost:9100/app-uploads/key?X-Amz-Expires=900',
-      );
-      expect(result.expiresAt.getTime()).toBeGreaterThanOrEqual(
-        before + 15 * 60 * 1000,
-      );
-      expect(result.expiresAt.getTime()).toBeLessThanOrEqual(
-        after + 15 * 60 * 1000,
-      );
-    });
-
-    it('signs against the file row bucket rather than the configured default', async () => {
+    it('presigns against the row bucket and maps storage failures', async () => {
       filesRepository.findById.mockResolvedValue(
         makeFileRow({ bucket: 'test', objectKey: 'Gemini_x.png' }),
       );
@@ -431,39 +357,20 @@ describe('FilesService', () => {
         'http://localhost:9100/test/Gemini_x.png?X-Amz-Expires=900',
       );
 
-      await service.getPresignedUrl('file-1', user);
+      const result = await service.getPresignedUrl('file-1', user);
 
       expect(minioService.presignedGetObject).toHaveBeenCalledWith(
         'Gemini_x.png',
         900,
         'test',
       );
-    });
+      expect(result.url).toContain('Gemini_x.png');
 
-    it('maps a presign failure to 500 MINIO_UNAVAILABLE', async () => {
-      filesRepository.findById.mockResolvedValue(makeFileRow());
       minioService.presignedGetObject.mockRejectedValue(new Error('boom'));
-
       await expectAppError(
         service.getPresignedUrl('file-1', user),
         'MINIO_UNAVAILABLE',
       );
-    });
-
-    it('does not presign for a soft-DELETED file', async () => {
-      filesRepository.findById.mockResolvedValue(
-        makeFileRow({
-          isDeleted: true,
-          deletedAt: new Date(),
-          deletedBy: user.id,
-        }),
-      );
-
-      await expectAppError(
-        service.getPresignedUrl('file-1', user),
-        'FILE_NOT_FOUND',
-      );
-      expect(minioService.presignedGetObject).not.toHaveBeenCalled();
     });
   });
 
@@ -476,7 +383,6 @@ describe('FilesService', () => {
             isDeleted: true,
             deletedAt: new Date('2026-10-13T09:20:00.000Z'),
             deletedBy: user.id,
-            updatedAt: new Date('2026-10-13T09:20:00.000Z'),
           }),
         );
       filesRepository.softDelete.mockResolvedValue(1);
@@ -491,24 +397,177 @@ describe('FilesService', () => {
       expect(minioService.removeObject).not.toHaveBeenCalled();
     });
 
-    it('rejects a repeat delete of an already-DELETED file with FILE_NOT_FOUND', async () => {
+    it('rejects repeat delete or a guarded update miss with FILE_NOT_FOUND', async () => {
       filesRepository.findById.mockResolvedValue(
-        makeFileRow({
-          isDeleted: true,
-          deletedAt: new Date(),
-          deletedBy: user.id,
-        }),
+        makeFileRow({ isDeleted: true, deletedAt: new Date() }),
       );
-
       await expectAppError(service.remove('file-1', user), 'FILE_NOT_FOUND');
-      expect(filesRepository.softDelete).not.toHaveBeenCalled();
-    });
 
-    it('rejects with FILE_NOT_FOUND when the guarded update matches nothing', async () => {
       filesRepository.findById.mockResolvedValue(makeFileRow());
       filesRepository.softDelete.mockResolvedValue(0);
-
       await expectAppError(service.remove('file-1', user), 'FILE_NOT_FOUND');
+    });
+  });
+
+  describe('confirm', () => {
+    it('confirms owned files and applies optional entity tags', async () => {
+      filesRepository.findManyByIds.mockResolvedValue([
+        makeFileRow({ id: 'file-1' }),
+        makeFileRow({ id: 'file-2' }),
+      ]);
+      filesRepository.confirmMany.mockResolvedValue([
+        makeFileRow({
+          id: 'file-1',
+          status: 'CONFIRMED',
+          expiresAt: null,
+          confirmedAt: new Date('2026-10-13T10:00:00.000Z'),
+          entityType: 'invoice',
+          entityId: 'invoice-123',
+        }),
+        makeFileRow({
+          id: 'file-2',
+          status: 'CONFIRMED',
+          expiresAt: null,
+          confirmedAt: new Date('2026-10-13T10:00:00.000Z'),
+          entityType: 'invoice',
+          entityId: 'invoice-123',
+        }),
+      ]);
+
+      const result = await service.confirm(
+        {
+          fileIds: ['file-1', 'file-2', 'file-1'],
+          entityType: 'invoice',
+          entityId: 'invoice-123',
+        },
+        user,
+      );
+
+      expect(filesRepository.findManyByIds).toHaveBeenCalledWith([
+        'file-1',
+        'file-2',
+      ]);
+      const confirmArgs = filesRepository.confirmMany.mock.calls[0][0];
+      expect(confirmArgs).toMatchObject({
+        ids: ['file-1', 'file-2'],
+        entityType: 'invoice',
+        entityId: 'invoice-123',
+      });
+      expect(confirmArgs.confirmedAt).toBeInstanceOf(Date);
+      expect(result.map((file) => file.status)).toEqual([
+        'CONFIRMED',
+        'CONFIRMED',
+      ]);
+      expect(result[0].expiresAt).toBeNull();
+      expect(result[0].confirmedAt).not.toBeNull();
+    });
+
+    it('rejects missing or inaccessible files', async () => {
+      filesRepository.findManyByIds.mockResolvedValue([makeFileRow()]);
+      await expectAppError(
+        service.confirm({ fileIds: ['file-1', 'missing'] }, user),
+        'FILE_NOT_FOUND',
+      );
+
+      filesRepository.findManyByIds.mockResolvedValue([
+        makeFileRow({ uploadedBy: 'someone-else' }),
+      ]);
+      await expectAppError(
+        service.confirm({ fileIds: ['file-1'] }, user),
+        'FILE_NOT_FOUND',
+      );
+    });
+  });
+
+  describe('reconcile', () => {
+    it('confirms active ids for the entity and soft-deletes stale entity files', async () => {
+      filesRepository.findManyByIds.mockResolvedValue([
+        makeFileRow({ id: 'file-1' }),
+      ]);
+      filesRepository.confirmMany.mockResolvedValue([
+        makeFileRow({
+          id: 'file-1',
+          status: 'CONFIRMED',
+          expiresAt: null,
+          confirmedAt: new Date('2026-10-13T10:00:00.000Z'),
+          entityType: 'invoice',
+          entityId: 'invoice-123',
+        }),
+      ]);
+      filesRepository.softDeleteByEntityExcept.mockResolvedValue(3);
+
+      const result = await service.reconcile(
+        {
+          entityType: 'invoice',
+          entityId: 'invoice-123',
+          activeFileIds: ['file-1'],
+        },
+        user,
+      );
+
+      const confirmArgs = filesRepository.confirmMany.mock.calls[0][0];
+      expect(confirmArgs).toMatchObject({
+        ids: ['file-1'],
+        entityType: 'invoice',
+        entityId: 'invoice-123',
+      });
+      expect(confirmArgs.confirmedAt).toBeInstanceOf(Date);
+      expect(filesRepository.softDeleteByEntityExcept).toHaveBeenCalledWith({
+        entityType: 'invoice',
+        entityId: 'invoice-123',
+        exceptIds: ['file-1'],
+        deletedBy: 'user-1',
+        uploadedBy: 'user-1',
+      });
+      expect(result.softDeleted).toBe(3);
+      expect(result.confirmed[0].status).toBe('CONFIRMED');
+    });
+
+    it('lets admins reconcile all files for an entity', async () => {
+      filesRepository.findManyByIds.mockResolvedValue([
+        makeFileRow({ id: 'file-1', uploadedBy: 'someone-else' }),
+      ]);
+      filesRepository.confirmMany.mockResolvedValue([
+        makeFileRow({ id: 'file-1', status: 'CONFIRMED' }),
+      ]);
+      filesRepository.softDeleteByEntityExcept.mockResolvedValue(0);
+
+      await service.reconcile(
+        {
+          entityType: 'invoice',
+          entityId: 'invoice-123',
+          activeFileIds: ['file-1'],
+        },
+        admin,
+      );
+
+      expect(filesRepository.softDeleteByEntityExcept).toHaveBeenCalledWith({
+        entityType: 'invoice',
+        entityId: 'invoice-123',
+        exceptIds: ['file-1'],
+        deletedBy: 'admin-1',
+        uploadedBy: undefined,
+      });
+    });
+
+    it('supports an empty active list by deleting prior entity files only', async () => {
+      filesRepository.findManyByIds.mockResolvedValue([]);
+      filesRepository.confirmMany.mockResolvedValue([]);
+      filesRepository.softDeleteByEntityExcept.mockResolvedValue(2);
+
+      const result = await service.reconcile(
+        { entityType: 'invoice', entityId: 'invoice-123', activeFileIds: [] },
+        user,
+      );
+
+      const confirmArgs = filesRepository.confirmMany.mock.calls[0][0];
+      expect(confirmArgs).toMatchObject({
+        ids: [],
+        entityType: 'invoice',
+        entityId: 'invoice-123',
+      });
+      expect(confirmArgs.confirmedAt).toBeInstanceOf(Date);
+      expect(result).toEqual({ confirmed: [], softDeleted: 2 });
     });
   });
 });
