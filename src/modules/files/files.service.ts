@@ -1,6 +1,7 @@
 import { HttpStatus, Injectable, Logger } from '@nestjs/common';
 import { $Enums, type FileUpload, type Prisma } from '@prisma/client';
 import { createHash, randomUUID } from 'crypto';
+import { ConfigService } from '@nestjs/config';
 import type { AuthUser } from '../../common/interfaces/auth-user.interface.js';
 import { AppError } from '../../common/errors/app-error.js';
 import { FilesRepository } from './files.repository.js';
@@ -10,7 +11,7 @@ import {
   MAX_LIST_LIMIT,
   MIME_WHITELIST,
   PRESIGN_EXPIRY_SECONDS,
-  UPLOAD_PENDING_TTL_MS,
+  DEFAULT_PENDING_FILE_TTL_HOURS,
 } from './files.constants.js';
 import { sanitizeFilename } from './utils/sanitize-filename.js';
 import {
@@ -42,6 +43,7 @@ export class FilesService {
   constructor(
     private readonly filesRepository: FilesRepository,
     private readonly minioService: MinioService,
+    private readonly configService: ConfigService,
   ) {}
 
   ensureOwnershipOrAdmin(file: FileUpload, user: AuthUser): void {
@@ -104,6 +106,7 @@ export class FilesService {
 
     try {
       const now = Date.now();
+      const pendingTtlMs = this.getPendingFileTtlMs();
       const created = await this.filesRepository.create({
         bucket: this.minioService.bucketName,
         objectKey,
@@ -112,7 +115,7 @@ export class FilesService {
         sizeBytes: file.size,
         checksum,
         status: 'PENDING',
-        expiresAt: new Date(now + UPLOAD_PENDING_TTL_MS),
+        expiresAt: new Date(now + pendingTtlMs),
         entityType: metadata.entityType ?? null,
         entityId: metadata.entityId ?? null,
         uploadedBy: user.id,
@@ -342,5 +345,13 @@ export class FilesService {
     }
     const extension = originalName.slice(dotIndex + 1).toLowerCase();
     return MIME_WHITELIST[extension];
+  }
+
+  private getPendingFileTtlMs(): number {
+    const hours = this.configService.get<number>(
+      'PENDING_FILE_TTL_HOURS',
+      DEFAULT_PENDING_FILE_TTL_HOURS,
+    );
+    return hours * 60 * 60 * 1000;
   }
 }

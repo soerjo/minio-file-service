@@ -2,12 +2,13 @@ import type { FileUpload } from '@prisma/client';
 import { FilesService, type UploadedFile } from './files.service.js';
 import type { FilesRepository } from './files.repository.js';
 import type { MinioService } from './minio.service.js';
+import type { ConfigService } from '@nestjs/config';
 import type { AuthUser } from '../../common/interfaces/auth-user.interface.js';
 import { AppError } from '../../common/errors/app-error.js';
 import {
   MAX_FILE_SIZE_BYTES,
   MAX_LIST_LIMIT,
-  UPLOAD_PENDING_TTL_MS,
+  DEFAULT_PENDING_FILE_TTL_HOURS,
 } from './files.constants.js';
 
 const helloSha256 =
@@ -41,6 +42,10 @@ const minioService = {
   presignedGetObject: jest.fn(),
   removeObject: jest.fn(),
 } as unknown as jest.Mocked<MinioService>;
+
+const configService = {
+  get: jest.fn((_: string, defaultValue: unknown) => defaultValue),
+} as unknown as jest.Mocked<ConfigService>;
 
 async function expectAppError(
   promise: Promise<unknown>,
@@ -95,11 +100,14 @@ describe('FilesService', () => {
 
   beforeEach(() => {
     jest.resetAllMocks();
-    service = new FilesService(filesRepository, minioService);
+    configService.get.mockImplementation(
+      (_: string, defaultValue: unknown) => defaultValue,
+    );
+    service = new FilesService(filesRepository, minioService, configService);
   });
 
   describe('upload', () => {
-    it('stores the object first, then creates pending metadata that expires in 24 hours', async () => {
+    it('stores the object first, then creates pending metadata that expires after the default TTL', async () => {
       minioService.putObject.mockResolvedValue(undefined);
       filesRepository.create.mockImplementation((data) =>
         Promise.resolve(
@@ -141,16 +149,51 @@ describe('FilesService', () => {
         entityId: 'invoice-123',
         uploadedBy: 'user-1',
       });
+      const defaultTtlMs = DEFAULT_PENDING_FILE_TTL_HOURS * 60 * 60 * 1000;
+      expect(configService.get).toHaveBeenCalledWith(
+        'PENDING_FILE_TTL_HOURS',
+        DEFAULT_PENDING_FILE_TTL_HOURS,
+      );
       expect((createData.expiresAt as Date).getTime()).toBeGreaterThanOrEqual(
-        before + UPLOAD_PENDING_TTL_MS,
+        before + defaultTtlMs,
       );
       expect((createData.expiresAt as Date).getTime()).toBeLessThanOrEqual(
-        after + UPLOAD_PENDING_TTL_MS,
+        after + defaultTtlMs,
       );
       expect(result.status).toBe('PENDING');
       expect(result.expiresAt).not.toBeNull();
       expect(result.entityType).toBe('invoice');
       expect(result.entityId).toBe('invoice-123');
+    });
+
+    it('uses the configured pending-file TTL when creating expiresAt', async () => {
+      configService.get.mockReturnValueOnce(6);
+      minioService.putObject.mockResolvedValue(undefined);
+      filesRepository.create.mockImplementation((data) =>
+        Promise.resolve(
+          makeFileRow({
+            objectKey: data.objectKey,
+            expiresAt: data.expiresAt as Date,
+          }),
+        ),
+      );
+
+      const before = Date.now();
+      await service.upload(makeUploadedFile(), user);
+      const after = Date.now();
+
+      const createData = filesRepository.create.mock.calls[0][0];
+      const ttlMs = 6 * 60 * 60 * 1000;
+      expect(configService.get).toHaveBeenCalledWith(
+        'PENDING_FILE_TTL_HOURS',
+        DEFAULT_PENDING_FILE_TTL_HOURS,
+      );
+      expect((createData.expiresAt as Date).getTime()).toBeGreaterThanOrEqual(
+        before + ttlMs,
+      );
+      expect((createData.expiresAt as Date).getTime()).toBeLessThanOrEqual(
+        after + ttlMs,
+      );
     });
 
     it('stores null entity tags when no upload metadata is provided', async () => {

@@ -4,7 +4,9 @@ export const MAX_LIST_LIMIT = 100;
 
 export const PRESIGN_EXPIRY_SECONDS = 900;
 
-export const UPLOAD_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_PENDING_FILE_TTL_HOURS = 24;
+
+export const DEFAULT_PENDING_FILE_CLEANUP_CRON = '0 0 * * *';
 
 export const PURGE_BATCH_SIZE = 100;
 

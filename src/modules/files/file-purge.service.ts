@@ -1,30 +1,57 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { Cron } from '@nestjs/schedule';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { SchedulerRegistry } from '@nestjs/schedule';
+import { CronJob } from 'cron';
 import { FilesRepository } from './files.repository.js';
 import { MinioService } from './minio.service.js';
-import { PURGE_BATCH_SIZE } from './files.constants.js';
+import {
+  DEFAULT_PENDING_FILE_CLEANUP_CRON,
+  PURGE_BATCH_SIZE,
+} from './files.constants.js';
 export interface PurgeSummary {
   scanned: number;
   purged: number;
   bytes: number;
 }
 
+export const PENDING_FILE_CLEANUP_JOB_NAME = 'pending-file-cleanup';
+
 @Injectable()
-export class FilePurgeService {
+export class FilePurgeService implements OnModuleInit {
   private readonly logger = new Logger(FilePurgeService.name);
 
   constructor(
     private readonly filesRepository: FilesRepository,
     private readonly minioService: MinioService,
+    private readonly configService: ConfigService,
+    private readonly schedulerRegistry: SchedulerRegistry,
   ) {}
 
-  @Cron('0 0 * * *')
+  onModuleInit(): void {
+    const cronExpression = this.configService.get<string>(
+      'PENDING_FILE_CLEANUP_CRON',
+      DEFAULT_PENDING_FILE_CLEANUP_CRON,
+    );
+    const job = CronJob.from({
+      cronTime: cronExpression,
+      onTick: async () => {
+        await this.handleCron();
+      },
+      start: false,
+    });
+    this.schedulerRegistry.addCronJob(PENDING_FILE_CLEANUP_JOB_NAME, job);
+    job.start();
+    this.logger.log(
+      `Scheduled pending file cleanup with cron expression "${cronExpression}"`,
+    );
+  }
+
   async handleCron(): Promise<void> {
     await this.purgeExpiredPending();
   }
 
   /**
-   * Permanently removes pending uploads whose 24-hour confirmation window
+   * Permanently removes expired pending uploads after the configured confirmation window
    * elapsed. The MinIO object is removed before the metadata row, so storage
    * failures leave the row eligible for the next cleanup run.
    */

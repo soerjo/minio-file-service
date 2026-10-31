@@ -1,4 +1,5 @@
 import { plainToInstance } from 'class-transformer';
+import { validateCronExpression } from 'cron';
 import {
   IsBoolean,
   IsEnum,
@@ -91,6 +92,16 @@ class EnvironmentVariables {
   @Min(1)
   @IsOptional()
   HARD_DELETE_RETENTION_DAYS: number = 365;
+
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  PENDING_FILE_TTL_HOURS: number = 24;
+
+  @IsString()
+  @IsNotEmpty()
+  @IsOptional()
+  PENDING_FILE_CLEANUP_CRON: string = '0 0 * * *';
 }
 
 export function validate(config: Record<string, unknown>) {
@@ -98,6 +109,15 @@ export function validate(config: Record<string, unknown>) {
     enableImplicitConversion: true,
   });
   const errors = validateSync(validated, { skipMissingProperties: false });
+
+  const cronValidation = validateCronExpression(
+    validated.PENDING_FILE_CLEANUP_CRON,
+  );
+  if (!cronValidation.valid) {
+    throw new Error(
+      `PENDING_FILE_CLEANUP_CRON must be a valid cron expression: ${cronValidation.error?.message ?? 'invalid cron expression'}`,
+    );
+  }
 
   if (errors.length > 0) {
     throw new Error(errors.toString());
